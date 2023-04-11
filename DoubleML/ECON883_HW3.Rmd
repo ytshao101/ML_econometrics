@@ -1,0 +1,234 @@
+---
+title: "ECON883_HW3"
+author: "Yutong Shao"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+1.  Paper: Education, HIV, and early fertility: Experimental evidence from Kenya. *American Economic Review*.
+2.  Abstract:
+
+> A seven-year randomized evaluation suggests education subsidies reduce adolescent girls' dropout, pregnancy, and marriage but not sexually transmitted infection (STI). The government's HIV curriculum, which stresses abstinence until marriage, does not reduce pregnancy or STI. Both programs combined reduce STI more, but cut dropout and pregnancy less, than education subsidies alone. These results are inconsistent with a model of schooling and sexual behavior in which both pregnancy and STI are determined by one factor (unprotected sex), but consistent with a two-factor model in which choices between committed and casual relationships also affect these outcomes.
+
+3.  data source: <https://www.openicpsr.org/openicpsr/project/112899/version/V1/view>
+
+4.  model:
+
+    $$
+    Y_{is} = \alpha + \beta T_s + X_s' \mu + \eta Age_i + \epsilon_{is}
+    $$
+
+    where $Y_{is}$ is the outcome for student $i$ enrolled in school $s$ (dropped out or not); $T_s$ is a dummy variable equal to 1 if schools benefitted from uniform program (treatment); $X_s$ is a vector of school-level controls (student sex ratio, standardized KCPE score, number of teachers); $Age_{is}$ is student $i$'s age
+
+## Data preprocessing
+
+```{r}
+
+# remove variables from work space
+rm(list = ls())
+
+set.seed(2023)  # for reproducability
+
+# LIBRARIES
+library(haven)  # for data loading
+library(dplyr)  # for easy data shaping
+library(ggplot2)  # for plotting
+library(tidyr)
+library(randomForest)
+library(xgboost)
+library(readxl)
+library(xtable)
+
+options(warn=-1)
+
+```
+
+```{r}
+# load data
+school_fe <- read_dta('/Users/shaoyutong/Library/Mobile Documents/com~apple~CloudDocs/ECON883/data/HIV_Duflo/school_info.dta')
+
+stu_df <- read_dta('/Users/shaoyutong/Library/Mobile Documents/com~apple~CloudDocs/ECON883/data/HIV_Duflo/studysample_allmerged.dta')
+```
+
+```{r}
+school_cols_use <- c('schoolid', 'HIVtreat', 'Utreat', 'sdkcpe', 'stratum',
+                     'total02', 'ratio02', 'situation')
+
+stu_cols_use <- c('schoolid', 'pupilid', 'HIVtreat', 'Utreat', 'stratum',
+                  'sex', 'yrbirth', 'dropout07v2')
+
+school_simp <- school_fe[school_cols_use]
+stu_simp <- stu_df[stu_cols_use]
+
+df <- merge(stu_simp, school_simp, by = 'schoolid', all.x = TRUE)
+colnames(df)
+```
+
+```{r}
+
+df1 <- df[c("schoolid", "pupilid","dropout07v2", "HIVtreat.x", 
+            "Utreat.x", "stratum.x", "sex","yrbirth", "sdkcpe",
+            "total02", "ratio02", "situation")]
+
+df1_renamed <- rename(df1,  c('Y'='dropout07v2', 'HIVtreat'='HIVtreat.x', 
+               'Utreat'='Utreat.x', 'stratum'='stratum.x'))
+
+# encoding stratums
+encoder <- model.matrix(~stratum-1, df1_renamed) %>% as.data.frame()
+
+df2 <- cbind(df1_renamed, encoder)
+df2$age <- 2005 - df$yrbirth
+
+```
+
+## Linear regression of outcome on treatment
+
+```{r}
+
+lm(Y ~ HIVtreat + Utreat, df2) %>% summary()
+lm(Y ~ HIVtreat + Utreat + HIVtreat * Utreat, df2) %>% summary()
+```
+
+## Linear regression of outcome on treatment and covariates
+
+```{r}
+# colnames(df)
+lm(Y ~ HIVtreat + Utreat + HIVtreat * Utreat + total02 + ratio02 + sdkcpe + age, df2) %>% summary()
+
+```
+
+## Partially linear model: double machine learning and cross-fitting
+
+```{r}
+dat_sel <- na.omit(df2)
+
+# specifications for residualization
+fY <- Y ~ total02 + ratio02 + sdkcpe + age
+fX <- Utreat ~ total02 + ratio02 + sdkcpe + age
+# fX2 <- Utreat ~ total02 + ratio02 + sdkcpe + age
+
+# get covariate matrices
+regY <- lm(fY, data=dat_sel, x=TRUE, y=TRUE)
+regX <- lm(fX, data=dat_sel, x=TRUE, y=TRUE)
+# regX2 <- lm(fX2, data=dat_sel, x=TRUE, y=TRUE)
+
+```
+
+I set repeat time and cross-fitting folds to be 3 for time and computation limits.
+
+```{r}
+# repeated cross-fitting
+time0 <- Sys.time()
+S <- 3  # how often?
+bhats <- matrix(nrow=S,ncol=3)
+vs <- matrix(nrow=S,ncol=3)
+for (s in seq(S)) {
+  if ((s==1) | (s%%10==0)) { cat(paste(Sys.time(), s,"/",S,"\n")) }
+  # create folds for cross-fitting
+  nfolds <- 3
+  foldid <- sample(rep(seq(nfolds), length = nrow(dat_sel)))
+  # resids <- matrix(nrow=length(foldid),ncol=3)
+  resids_rf <- matrix(nrow=length(foldid),ncol=3)
+  resids_xgb <- matrix(nrow=length(foldid),ncol=3)
+  # resids_nn <- matrix(nrow=length(foldid),ncol=3)
+  resids_lm <- matrix(nrow=length(foldid),ncol=3)
+  for (f in seq(nfolds)) {
+   
+    # random forest
+    rfY <- randomForest(formula = Y ~ total02 + ratio02 + sdkcpe + age,
+                       data=dat_sel[foldid!=f,])
+    resids_rf[foldid==f,1] <- regY$y[foldid==f] - predict(rfY, newdata = dat_sel[foldid==f,])
+    
+    rfX <- randomForest(formula = Utreat ~ total02 + ratio02 + sdkcpe + age,
+                        data=dat_sel[foldid!=f,])
+    resids_rf[foldid==f,2] <- regX$y[foldid==f] - predict(rfX, newdata = dat_sel[foldid==f,])
+    
+    
+    # boosted trees
+    xgb.cv <- xgb.cv(data = regY$x[foldid!=f,], label = regY$y[foldid!=f],
+                     nfold=10, nrounds=10, verbose=FALSE)
+    xgbY <- xgboost(data = regY$x[foldid!=f,], label = regY$y[foldid!=f],
+                    nrounds=which.min(xgb.cv$evaluation_log$test_rmse_mean),
+                    verbose=FALSE)
+    resids_xgb[foldid==f,1] <- regY$y[foldid==f] - predict(xgbY, newdata = regY$x[foldid==f,])
+    
+    xgb.cv <- xgb.cv(data = regX$x[foldid!=f,], label = regX$y[foldid!=f],
+                     nfold=10, nrounds=10, verbose=FALSE)
+    xgbX <- xgboost(data = regX$x[foldid!=f,], label = regX$y[foldid!=f],
+                    nrounds=which.min(xgb.cv$evaluation_log$test_rmse_mean),
+                    verbose=FALSE)
+    resids_xgb[foldid==f,2] <- regX$y[foldid==f] - predict(xgbX, newdata = regX$x[foldid==f,])
+    
+    
+    # linear model with few covariates
+    rY <- lm(Y ~ ratio02 + sdkcpe + age, data=dat_sel[foldid!=f,])
+    resids_lm[foldid==f,1] <- regY$y[foldid==f] - predict(rY, newdata = dat_sel[foldid==f,])
+    rX <- lm(Utreat ~ ratio02 + sdkcpe + age, data=dat_sel[foldid!=f,])
+    resids_lm[foldid==f,2] <- regX$y[foldid==f] - predict(rX, newdata = dat_sel[foldid==f,])
+
+    
+  }
+  # estimator
+  # bhats[s,1] <- sum(resids[,1] * resids[,2])/sum(resids[,2]^2)
+  bhats[s,1] <- sum(resids_rf[,1] * resids_rf[,2])/sum(resids_rf[,2]^2)
+  bhats[s,2] <- sum(resids_xgb[,1] * resids_xgb[,2])/sum(resids_xgb[,2]^2)
+  # bhats[s,4] <- sum(resids_nn[,1] * resids_nn[,2])/sum(resids_nn[,2]^2)
+  bhats[s,3] <- sum(resids_lm[,1] * resids_lm[,2])/sum(resids_lm[,2]^2)
+  
+  # variance formula
+  # psi <- mean((resids[,2]*(resids[,1]-regX$y*bhats[s,1]))^2)
+  # phi <- mean(-resids[,2]*regX$y)
+  # vs[s,1] <- psi/phi^2/length(foldid)
+  psi <- mean((resids_rf[,2]*(resids_rf[,1]-regX$y*bhats[s,1]))^2)
+  phi <- mean(-resids_rf[,2]*regX$y)
+  vs[s,1] <- psi/phi^2/length(foldid)
+  psi <- mean((resids_xgb[,2]*(resids_xgb[,1]-regX$y*bhats[s,2]))^2)
+  phi <- mean(-resids_xgb[,2]*regX$y)
+  vs[s,2] <- psi/phi^2/length(foldid)
+  # psi <- mean((resids_nn[,2]*(resids_nn[,1]-regX$y*bhats[s,4]))^2)
+  # phi <- mean(-resids_nn[,2]*regX$y)
+  # vs[s,4] <- psi/phi^2/length(foldid)
+  psi <- mean((resids_lm[,2]*(resids_lm[,1]-regX$y*bhats[s,3]))^2)
+  phi <- mean(-resids_lm[,2]*regX$y)
+  vs[s,3] <- psi/phi^2/length(foldid)
+}
+time1 <- Sys.time()
+time1-time0
+# recommended estimate:
+# bhat <- apply(bhats,2,median)
+# round(bhat,3)
+```
+
+```{r}
+betahat <- data.frame(bhats, 
+                      cols=c('Randome Forest', 'XGBoost', 'Linear Regression'))
+betahat <- rename(betahat, c('Randome Forest'='X1', 
+                  'XGBoost'='X2', 
+                  'Linear Regression'='X3'))
+
+# xtable(betahat, type = "latex", file = "betahat.tex")
+```
+
+### Estimation results
+
+| Random Forest |   XGBoost    | Linear regression |
+|:-------------:|:------------:|:-----------------:|
+| -0.008078754  | -0.006065107 |    -0.02830536    |
+
+: Estimation of linear regression and double machine learning method
+
+Table reports the median of cross-fitting procedure. Double machine learning method yield different estimations on average treatment effects. The results from random forest and boosted decision tree methods are similar. But if the number of validation folds and rep times are set to be larger, the estimation might also be different. In general, linear regression tends to overestimate the treatment effect compared with double ML method. Reasons could be that linear form fails to capture the actual covariates form and how they came into effect.
+
+## References
+
+Duflo, E., Dupas, P., & Kremer, M. (2015). Education, HIV, and early fertility: Experimental evidence from Kenya. *American Economic Review*, *105*(9), 2757-2797.
+
+Chernozhukov, V., Chetverikov, D., Demirer, M., Duflo, E., Hansen, C., Newey, W., & Robins, J. (2018). Double/debiased machine learning for treatment and structural parameters.
+
+Code was adapted from class resources provided by Prof. Pollmann.
