@@ -1,5 +1,7 @@
 # ML_econometrics
 
-Applying ML algorithms in econometrics. Code mainly written in R. 
+Machine learning with applications in econometrics;
 
-All adapted from course materials.
+All were adapted from course materials.
+
+Programming language: R.
